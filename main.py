@@ -230,7 +230,7 @@ if __name__ == "__main__":
     # if we want a minimum number of threads, don't stop trying until we hit said count
     tries = None if args.count else args.tries
     board = "g"
-    api = Api(ratelimit=0)
+    api = Api(ratelimit=1)
 
     if args.pop:
         target_threads = pop_thread_cache()
