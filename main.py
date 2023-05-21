@@ -65,9 +65,8 @@ class Api:
             time.sleep(wait_time)
             return self.download_img(url)
 
-    def get_catalog(self, board: str) -> list[int]:
-        catalog_endpoint = f"/{board}/archive.json"
-        res = requests.get(JSON_URL + catalog_endpoint).json()
+    def get_archive_threadnos(self, board: str) -> list[int]:
+        res = requests.get(JSON_URL + f"/{board}/archive.json").json()
         self.log(res, DEBUG)
         return res
 
@@ -101,6 +100,10 @@ def include_img(post: dict) -> bool:
     return True
 
 
+def get_thread_no(thread: list[dict]) -> int:
+    return thread[0].get("no")
+
+
 def get_img_urls_from_thread(board: str, thread: list[dict]) -> list[str]:
     return list(map(lambda post: get_img_url(board, post), filter(include_img, filter(has_img, thread))))
 
@@ -115,41 +118,17 @@ def get_seen_threadnos() -> list[int]:
     return [thread[0].get("no") for thread in data if thread and thread[0]]
 
 
-def find_matching(board: str, pattern: str, api: Api, t=None, c=None) -> list[list[dict]]:
-    sdg_threads = []
-    catalog = api.get_catalog(board)
-    if t is None or c:
-        t = len(catalog)
-    catalog.sort(reverse=True)
-    seen_threadnos = get_seen_threadnos()
-    try:
-        for index, thread_no in enumerate(catalog[:t]):
-            if thread_no in seen_threadnos:
-                print(f"thread #{thread_no} has already been cached or downloaded. Skipping.")
-                continue
-            thread = api.get_thread(board, thread_no)
-            matches = get_thread_name(thread).__contains__(pattern)
-            match_str = "\t\t\t ***MATCH***" if matches else ""
-            api.log(f"{index}: {thread_no} -> {get_thread_name(thread)} {match_str}", NORMAL)
-            if matches:
-                sdg_threads.append(thread)
-            if c and len(sdg_threads) >= c:
-                return sdg_threads
-    except KeyboardInterrupt:
-        pass
-
-    return sdg_threads
-
-
-# returns number of (new, duplicate) threads
-def cache_threads(threads: list[list[dict]]) -> (int, int):
+# adds a thread to thread_cache if it's not there already.
+# returns true if a new unique thread was cached
+def cache_thread(thread: list[dict]) -> bool:
     # Check if thread_cache.json exists, if not, create one.
     if not os.path.isfile('thread_cache.json'):
         with open('thread_cache.json', 'w') as f:
             json.dump([], f)
 
     threadnos = get_seen_threadnos()
-    new_threads = list(filter(lambda t: t[0].get("no") not in threadnos, threads))
+    if get_thread_no(thread) in threadnos:
+        return False
 
     with open('thread_cache.json', 'r') as json_file:
         try:
@@ -158,15 +137,59 @@ def cache_threads(threads: list[list[dict]]) -> (int, int):
             data = []
 
     # Append new threads to existing data
-    data.extend(new_threads)
+    data.append(thread)
 
     # Write back to the file
     with open('thread_cache.json', 'w') as json_file:
         json.dump(data, json_file)
 
-    return len(new_threads), len(threads) - len(new_threads)
+    return True
 
 
+# returns the number of new threads that were cached
+def cache_threads(threads: list[list[dict]]) -> (int, int):
+    s = 0
+    for thread in threads:
+        s += 1 if cache_thread(thread) else 0
+    return s
+
+
+def find_matching(_board: str, _pattern: str, api: Api, _tries=None, _count=None) -> list[list[dict]]:
+    print(f"looking for threads in {_board} with title containing {_pattern}")
+    try_str = "" if _tries is None else f"will try {_tries} archive entries..."
+    count_str = "" if _count is None else f"will stop when found {_count} matching threads..."
+    print(try_str)
+    print(count_str)
+    print("="*20)
+    sdg_threads = []
+    archive = api.get_archive_threadnos(_board)
+    if _tries is None:
+        _tries = len(archive)
+    archive.sort(reverse=True)
+    seen_threadnos = get_seen_threadnos()
+    try:
+        for index, thread_no in enumerate(archive[:_tries]):
+            if thread_no in seen_threadnos:
+                print(f"thread #{thread_no} has already been cached or downloaded. Skipping.")
+                continue
+            thread = api.get_thread(_board, thread_no)
+            matches = get_thread_name(thread).__contains__(_pattern)
+            match_str = "\t\t\t ***MATCH***" if matches else ""
+            api.log(f"{index}: {thread_no} -> {get_thread_name(thread)} {match_str}", NORMAL)
+
+            if matches:
+                cache_thread(thread)
+                sdg_threads.append(thread)
+
+            if _count and len(sdg_threads) >= _count:
+                return sdg_threads
+    except KeyboardInterrupt:
+        pass
+
+    return sdg_threads
+
+
+# side effect: removes items from cache that have been seen aka fully downloaded
 def mark_thread_as_seen(threadno: int):
     if not os.path.isfile('seen_threads.json'):
         with open('seen_threads.json', 'w') as f:
@@ -186,6 +209,28 @@ def mark_thread_as_seen(threadno: int):
     with open('seen_threads.json', 'w') as json_file:
         json.dump(data, json_file)
 
+    # read contents of thread_cache into cache
+    with open('thread_cache.json', 'r') as json_file:
+        try:
+            cache = json.load(json_file)
+        except json.JSONDecodeError:
+            cache = []
+
+    buf = []
+    for item in cache:
+        if get_thread_no(item) not in data:
+            buf.append(item)
+
+    to_be_purged = list(map(get_thread_no, [c for c in cache if c not in buf]))
+
+    # effectively removes the no-longer-needed items in cache
+    with open('thread_cache.json', 'w') as json_file:
+        try:
+            json.dump(buf, json_file)
+            print(f"purged {len(to_be_purged)} items from cache: {to_be_purged}")
+        except json.JSONDecodeError:
+            print("failed to clear cache")
+
 
 def pop_thread_cache() -> list[list[dict]]:
     with open('thread_cache.json', 'r') as json_file:
@@ -198,10 +243,10 @@ def download_from_threads(api: Api, board: str, threads: list[list[dict]]):
     total_img_count = sum(1 for thread in threads for post in thread if has_img(post))
 
     progress = 0
-    for thread in threads:
+    for i, thread in enumerate(threads):
         thread_no = thread[0].get("no")
         urls = get_img_urls_from_thread(board, thread)
-        api.log(f"downloading {len(urls)} files.", NORMAL)
+        api.log(f"downloading {len(urls)} files from thread {i+1}/{len(threads)}", NORMAL)
         for url in urls:
             progress += 1
             path = api.img_url_to_path(url)
@@ -211,6 +256,7 @@ def download_from_threads(api: Api, board: str, threads: list[list[dict]]):
             else:
                 api.log(f"file {path} already exists, skipping...", NORMAL)
 
+        api.log(f"%%%%% FULLY DOWNLOADED thread: {thread_no} %%%%%%", NORMAL)
         # once fully downloaded, mark the thread as seen
         mark_thread_as_seen(thread_no)
 
@@ -221,35 +267,52 @@ if __name__ == "__main__":
     parser.add_argument('-pattern', type=str, default="/sdg/", help="what to look for in thread title to determine"
                                                                     "whether or not to download its images")
     parser.add_argument('-board', type=str, default="g", help="board to search in")
-    parser.add_argument('--cache', action="store_true", default=False, help='cache, but not download,'
+
+    # threads are cached by default as the download process runs in case of an unexpected exit
+    parser.add_argument('--cache', action="store_true", default=False, help='ONLY cache, but do not download,'
                                                                             ' threads for later processing')
     parser.add_argument('--pop', action="store_true", default=False, help='download from cached threads')
-    parser.add_argument('--tries', type=int, default=500, help='how many archive threads to check. defaults to 500')
-    parser.add_argument('--count', type=int, default=0, help='keep pulling threads from archive until N '
-                                                                      'matching threads found')
+    parser.add_argument('--count', type=int, default=1, help='keep pulling threads from archive until N '
+                                                             'matching threads found. default=1')
+    parser.add_argument('--tries', type=int, default=0, help='go by attempts at finding matches in the archive, '
+                                                             'rather than successes. useful if you want to try to'
+                                                             'download the entire archive')
+
+    parser.add_argument('--inspect', action="store_true", default=False, help='inspect the current cache')
+
     args = parser.parse_args()
+
+    if args.inspect:
+        cache = pop_thread_cache()
+        threadnos = list(map(get_thread_no, cache))
+        if threadnos:
+            print(f"found ({len(threadnos)}) threads: {threadnos} in cache.")
+            exit(0)
+        else:
+            print("cache is empty.")
 
     if args.cache and args.pop:
         print("you called the program with --cache and --pop (this does nothing) so the program will exit now.")
         exit(0)
 
     # if we want a minimum number of threads, don't stop trying until we hit said count
-    tries = None if args.count else args.tries
+    tries = None if args.tries == 0 else args.tries
     board = args.board
     pattern = args.pattern
     api = Api(outdir=args.outdir, ratelimit=1)
 
     if args.pop:
         target_threads = pop_thread_cache()
+        api.log(f"found {len(target_threads)} threads to download from cache.", NORMAL)
     else:
         target_threads = find_matching(board, pattern, api, tries, args.count)
-
-    # I stopped trying to generalize at some point which is why dumb stuff like this exists
-    api.log(f"found {len(target_threads)} matching threads in /{board}/ archive...", NORMAL)
+        api.log("="*20, NORMAL)
+        api.log(f"found {len(target_threads)} matching threads in /{board}/ archive...", NORMAL)
 
     if args.cache:
-        new, duplicates = cache_threads(target_threads)
-        api.log(f"cached {new} new threads, found {duplicates} duplicates sitting in cache", NORMAL)
+        successes = cache_threads(target_threads)
+        api.log(f"cached {successes} new threads, found {len(target_threads) - successes} "
+                f"duplicates sitting in cache", NORMAL)
     else:
         download_from_threads(api, board, target_threads)
         api.log("done :3", NORMAL)
