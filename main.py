@@ -18,11 +18,13 @@ SILENT = 0
 # the functions that actually make requests go in this class
 # .. so we can optionally track state and respect the rate-limiter
 class Api:
-    def __init__(self, ratelimit=None):
+    def __init__(self, outdir, ratelimit=None):
         self.loglvl = NORMAL
-        self.img_path = "archive"
-        if not os.path.exists('archive'):
-            os.makedirs('archive')
+
+        self.img_path = outdir
+
+        if not os.path.exists(self.img_path):
+            os.makedirs(self.img_path)
 
         if ratelimit is None:
             self.ratelimit = 1
@@ -40,6 +42,8 @@ class Api:
 
     def download_img(self, url):
         path = self.img_url_to_path(url)
+        if url.split('.')[-1] == "webm":
+            self.log(f"skipping .webm file...", NORMAL)
         try:
             local_file_path, headers = urllib.request.urlretrieve(url, path)
             self.log(f"Successfully downloaded {url} to {local_file_path}", NORMAL)
@@ -84,10 +88,6 @@ def get_thread_name(thread: list[dict]) -> str:
     return ret
 
 
-def thread_is_sdg(thread: list[dict]) -> bool:
-    return get_thread_name(thread).__contains__("/sdg/")
-
-
 def get_img_url(board: str, post: dict) -> str:
     return IMG_URL + f'/{board}' + f'/{post.get("tim")}' + post.get("ext")
 
@@ -115,9 +115,9 @@ def get_seen_threadnos() -> list[int]:
     return [thread[0].get("no") for thread in data if thread and thread[0]]
 
 
-def get_sdg_threads(api: Api, t=None, c=None) -> list[list[dict]]:
+def find_matching(board: str, pattern: str, api: Api, t=None, c=None) -> list[list[dict]]:
     sdg_threads = []
-    catalog = api.get_catalog("g")
+    catalog = api.get_catalog(board)
     if t is None or c:
         t = len(catalog)
     catalog.sort(reverse=True)
@@ -128,10 +128,10 @@ def get_sdg_threads(api: Api, t=None, c=None) -> list[list[dict]]:
                 print(f"thread #{thread_no} has already been cached or downloaded. Skipping.")
                 continue
             thread = api.get_thread(board, thread_no)
-            is_sdg = thread_is_sdg(thread)
-            match_str = "\t\t\t ***MATCH***" if is_sdg else ""
+            matches = get_thread_name(thread).__contains__(pattern)
+            match_str = "\t\t\t ***MATCH***" if matches else ""
             api.log(f"{index}: {thread_no} -> {get_thread_name(thread)} {match_str}", NORMAL)
-            if is_sdg:
+            if matches:
                 sdg_threads.append(thread)
             if c and len(sdg_threads) >= c:
                 return sdg_threads
@@ -197,48 +197,55 @@ def pop_thread_cache() -> list[list[dict]]:
 def download_from_threads(api: Api, board: str, threads: list[list[dict]]):
     total_img_count = sum(1 for thread in threads for post in thread if has_img(post))
 
+    progress = 0
     for thread in threads:
         thread_no = thread[0].get("no")
         urls = get_img_urls_from_thread(board, thread)
         api.log(f"downloading {len(urls)} files.", NORMAL)
-        for i, url in enumerate(urls):
+        for url in urls:
+            progress += 1
             path = api.img_url_to_path(url)
             if not os.path.exists(path):
-                print(f"[{i}/{total_img_count}] ", end="")
+                print(f"[{progress}/{total_img_count}] ", end="")
                 api.queue_download(url)
             else:
                 api.log(f"file {path} already exists, skipping...", NORMAL)
 
-        # once done downloading, mark the thread as seen
+        # once fully downloaded, mark the thread as seen
         mark_thread_as_seen(thread_no)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Scrapes stable diffusion general threads")
+    parser.add_argument('-outdir', type=str, default="sdg", help="folder to store images in")
+    parser.add_argument('-pattern', type=str, default="/sdg/", help="what to look for in thread title to determine"
+                                                                    "whether or not to download its images")
+    parser.add_argument('-board', type=str, default="g", help="board to search in")
     parser.add_argument('--cache', action="store_true", default=False, help='cache, but not download,'
                                                                             ' threads for later processing')
     parser.add_argument('--pop', action="store_true", default=False, help='download from cached threads')
     parser.add_argument('--tries', type=int, default=500, help='how many archive threads to check. defaults to 500')
     parser.add_argument('--count', type=int, default=0, help='keep pulling threads from archive until N '
-                                                                      '/sdg/ threads found')
+                                                                      'matching threads found')
     args = parser.parse_args()
 
     if args.cache and args.pop:
-        print("you called the program with --cache and --pop, the program will exit now.")
+        print("you called the program with --cache and --pop (this does nothing) so the program will exit now.")
         exit(0)
 
     # if we want a minimum number of threads, don't stop trying until we hit said count
     tries = None if args.count else args.tries
-    board = "g"
-    api = Api(ratelimit=1)
+    board = args.board
+    pattern = args.pattern
+    api = Api(outdir=args.outdir, ratelimit=1)
 
     if args.pop:
         target_threads = pop_thread_cache()
     else:
-        target_threads = get_sdg_threads(api, tries, args.count)
+        target_threads = find_matching(board, pattern, api, tries, args.count)
 
     # I stopped trying to generalize at some point which is why dumb stuff like this exists
-    api.log(f"found {len(target_threads)} SDG threads in /{board}/ archive...", NORMAL)
+    api.log(f"found {len(target_threads)} matching threads in /{board}/ archive...", NORMAL)
 
     if args.cache:
         new, duplicates = cache_threads(target_threads)
